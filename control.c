@@ -77,7 +77,7 @@ int __init bch_ctrl_device_init(void)
 		goto error_cdev_add;
 	}
 
-	ctrl->class = class_create(THIS_MODULE, "bcache");
+	ctrl->class = class_create("bcache");
 	if (IS_ERR(ctrl->class)) {
 		pr_err("Cannot create control chrdev class.\n");
 		result = PTR_ERR(ctrl->class);

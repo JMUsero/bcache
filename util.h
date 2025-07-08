@@ -4,6 +4,7 @@
 #define _BCACHE_UTIL_H
 
 #include <linux/blkdev.h>
+#include <linux/closure.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/sched/clock.h>
@@ -12,13 +13,6 @@
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <linux/crc64.h>
-#include <linux/version.h>
-
-#include "closure.h"
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
-	#define PAGE_SECTORS		(PAGE_SIZE / 512)
-#endif
 
 struct closure;
 
@@ -564,18 +558,4 @@ static inline unsigned int fract_exp_two(unsigned int x,
 void bch_bio_map(struct bio *bio, void *base);
 int bch_bio_alloc_pages(struct bio *bio, gfp_t gfp_mask);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-static inline sector_t bdev_sectors(struct block_device *bdev)
-{
-	return bdev->bd_inode->i_size >> 9;
-}
-#define BDEV_SECTORS(b) bdev_sectors(b)
-#else
-#define BDEV_SECTORS(b) bdev_nr_sectors(b)
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
-extern void *kvrealloc(const void *p, size_t oldsize, size_t newsize,
-		gfp_t flags);
-#endif
 #endif /* _BCACHE_UTIL_H */

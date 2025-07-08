@@ -25,7 +25,7 @@
 
 struct kmem_cache *bch_search_cache;
 
-static void bch_data_insert_start(struct closure *cl);
+static CLOSURE_CALLBACK(bch_data_insert_start);
 
 static unsigned int cache_mode(struct cached_dev *dc)
 {
@@ -44,18 +44,10 @@ static void bio_csum(struct bio *bio, struct bkey *k)
 	uint64_t csum = 0;
 
 	bio_for_each_segment(bv, bio, iter) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		void *d = kmap(bv.bv_page) + bv.bv_offset;
-#else
 		void *d = bvec_kmap_local(&bv);
-#endif
 
 		csum = crc64_be(csum, d, bv.bv_len);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		kunmap(bv.bv_page);
-#else
 		kunmap_local(d);
-#endif
 	}
 
 	k->ptr[KEY_PTRS(k)] = csum & (~0ULL >> 1);
@@ -63,9 +55,9 @@ static void bio_csum(struct bio *bio, struct bkey *k)
 
 /* Insert data into cache */
 
-static void bch_data_insert_keys(struct closure *cl)
+static CLOSURE_CALLBACK(bch_data_insert_keys)
 {
-	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+	closure_type(op, struct data_insert_op, cl);
 	atomic_t *journal_ref = NULL;
 	struct bkey *replace_key = op->replace ? &op->replace_key : NULL;
 	int ret;
@@ -144,9 +136,9 @@ out:
 	continue_at(cl, bch_data_insert_keys, op->wq);
 }
 
-static void bch_data_insert_error(struct closure *cl)
+static CLOSURE_CALLBACK(bch_data_insert_error)
 {
-	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+	closure_type(op, struct data_insert_op, cl);
 
 	/*
 	 * Our data write just errored, which means we've got a bunch of keys to
@@ -171,7 +163,7 @@ static void bch_data_insert_error(struct closure *cl)
 
 	op->insert_keys.top = dst;
 
-	bch_data_insert_keys(cl);
+	bch_data_insert_keys(&cl->work);
 }
 
 static void bch_data_insert_endio(struct bio *bio)
@@ -192,9 +184,9 @@ static void bch_data_insert_endio(struct bio *bio)
 	bch_bbio_endio(op->c, bio, bio->bi_status, "writing data to cache");
 }
 
-static void bch_data_insert_start(struct closure *cl)
+static CLOSURE_CALLBACK(bch_data_insert_start)
 {
-	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+	closure_type(op, struct data_insert_op, cl);
 	struct bio *bio = op->bio, *n;
 
 	if (op->bypass)
@@ -252,7 +244,7 @@ static void bch_data_insert_start(struct closure *cl)
 		trace_bcache_cache_insert(k);
 		bch_keylist_push(&op->insert_keys);
 
-		bio_set_op_attrs(n, REQ_OP_WRITE, 0);
+		n->bi_opf = REQ_OP_WRITE;
 		bch_submit_bbio(n, op->c, k, 0);
 	} while (n != bio);
 
@@ -313,16 +305,16 @@ err:
  * If op->bypass is true, instead of inserting the data it invalidates the
  * region of the cache represented by op->bio and op->inode.
  */
-void bch_data_insert(struct closure *cl)
+CLOSURE_CALLBACK(bch_data_insert)
 {
-	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+	closure_type(op, struct data_insert_op, cl);
 
 	trace_bcache_write(op->c, op->inode, op->bio,
 			   op->writeback, op->bypass);
 
 	bch_keylist_init(&op->insert_keys);
 	bio_get(op->bio);
-	bch_data_insert_start(cl);
+	bch_data_insert_start(&cl->work);
 }
 
 /*
@@ -409,7 +401,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 	}
 
 	if (bypass_torture_test(dc)) {
-		if ((get_random_int() & 3) == 3)
+		if (get_random_u32_below(4) == 3)
 			goto skip;
 		else
 			goto rescale;
@@ -583,9 +575,9 @@ static int cache_lookup_fn(struct btree_op *op, struct btree *b, struct bkey *k)
 	return n == bio ? MAP_DONE : MAP_CONTINUE;
 }
 
-static void cache_lookup(struct closure *cl)
+static CLOSURE_CALLBACK(cache_lookup)
 {
-	struct search *s = container_of(cl, struct search, iop.cl);
+	closure_type(s, struct search, iop.cl);
 	struct bio *bio = &s->bio.bio;
 	struct cached_dev *dc;
 	int ret;
@@ -678,19 +670,8 @@ static void bio_complete(struct search *s)
 {
 	if (s->orig_bio) {
 		/* Count on bcache device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-		generic_end_io_acct(s->d->disk->queue, bio_op(s->orig_bio),
-				    &s->d->disk->part0, s->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-		bio_end_io_acct(s->orig_bio, s->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-		disk_end_io_acct(s->d->disk, bio_op(s->orig_bio), s->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-		part_end_io_acct(s->orig_bdev, s->orig_bio, s->start_time);
-#else
 		bio_end_io_acct_remapped(s->orig_bio, s->start_time,
 					 s->orig_bdev);
-#endif
 		trace_bcache_request_end(s->d, s->orig_bio);
 		s->orig_bio->bi_status = s->iop.status;
 		bio_endio(s->orig_bio);
@@ -704,12 +685,7 @@ static void do_bio_hook(struct search *s,
 {
 	struct bio *bio = &s->bio.bio;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-	bio_init(bio, NULL, 0);
-	__bio_clone_fast(bio, orig_bio);
-#else
 	bio_init_clone(orig_bio->bi_bdev, bio, orig_bio, GFP_NOIO);
-#endif
 	/*
 	 * bi_end_io can be set separately somewhere else, e.g. the
 	 * variants in,
@@ -722,9 +698,9 @@ static void do_bio_hook(struct search *s,
 	bio_cnt_set(bio, 3);
 }
 
-static void search_free(struct closure *cl)
+static CLOSURE_CALLBACK(search_free)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 
 	atomic_dec(&s->iop.c->search_inflight);
 
@@ -736,14 +712,9 @@ static void search_free(struct closure *cl)
 	mempool_free(s, &s->iop.c->search);
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-static inline struct search *search_alloc(struct bio *bio,
-					  struct bcache_device *d)
-#else
 static inline struct search *search_alloc(struct bio *bio,
 		struct bcache_device *d, struct block_device *orig_bdev,
 		unsigned long start_time)
-#endif
 {
 	struct search *s;
 
@@ -761,18 +732,8 @@ static inline struct search *search_alloc(struct bio *bio,
 	s->write		= op_is_write(bio_op(bio));
 	s->read_dirty_data	= 0;
 	/* Count on the bcache device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-	s->start_time		= jiffies;
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-	s->start_time		= bio_start_io_acct(bio);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-	s->start_time		= disk_start_io_acct(d->disk, bio_sectors(bio), bio_op(bio));
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	s->start_time		= part_start_io_acct(d->disk, &s->orig_bdev, bio);
-#else
 	s->orig_bdev		= orig_bdev;
 	s->start_time		= start_time;
-#endif
 	s->iop.c		= d->c;
 	s->iop.bio		= NULL;
 	s->iop.inode		= d->id;
@@ -788,20 +749,20 @@ static inline struct search *search_alloc(struct bio *bio,
 
 /* Cached devices */
 
-static void cached_dev_bio_complete(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_bio_complete)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
 	cached_dev_put(dc);
-	search_free(cl);
+	search_free(&cl->work);
 }
 
 /* Process reads */
 
-static void cached_dev_read_error_done(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_read_error_done)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 
 	if (s->iop.replace_collision)
 		bch_mark_cache_miss_collision(s->iop.c, s->d);
@@ -809,12 +770,12 @@ static void cached_dev_read_error_done(struct closure *cl)
 	if (s->iop.bio)
 		bio_free_pages(s->iop.bio);
 
-	cached_dev_bio_complete(cl);
+	cached_dev_bio_complete(&cl->work);
 }
 
-static void cached_dev_read_error(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_read_error)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct bio *bio = &s->bio.bio;
 
 	/*
@@ -840,9 +801,9 @@ static void cached_dev_read_error(struct closure *cl)
 	continue_at(cl, cached_dev_read_error_done, NULL);
 }
 
-static void cached_dev_cache_miss_done(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_cache_miss_done)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct bcache_device *d = s->d;
 
 	if (s->iop.replace_collision)
@@ -851,13 +812,13 @@ static void cached_dev_cache_miss_done(struct closure *cl)
 	if (s->iop.bio)
 		bio_free_pages(s->iop.bio);
 
-	cached_dev_bio_complete(cl);
+	cached_dev_bio_complete(&cl->work);
 	closure_put(&d->cl);
 }
 
-static void cached_dev_read_done(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_read_done)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
 	/*
@@ -869,20 +830,11 @@ static void cached_dev_read_done(struct closure *cl)
 	 */
 
 	if (s->iop.bio) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		bio_reset(s->iop.bio);
-#else
 		bio_reset(s->iop.bio, s->cache_miss->bi_bdev, REQ_OP_READ);
-#endif
 		s->iop.bio->bi_iter.bi_sector =
 			s->cache_miss->bi_iter.bi_sector;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		bio_copy_dev(s->iop.bio, s->cache_miss);
-#endif
 		s->iop.bio->bi_iter.bi_size = s->insert_bio_sectors << 9;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 		bio_clone_blkg_association(s->iop.bio, s->cache_miss);
-#endif
 		bch_bio_map(s->iop.bio, NULL);
 
 		bio_copy_data(s->cache_miss, s->iop.bio);
@@ -906,9 +858,9 @@ static void cached_dev_read_done(struct closure *cl)
 	continue_at(cl, cached_dev_cache_miss_done, NULL);
 }
 
-static void cached_dev_read_done_bh(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_read_done_bh)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
 	bch_mark_cache_accounting(s->iop.c, s->d,
@@ -960,22 +912,13 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
 	/* btree_search_recurse()'s btree iterator is no good anymore */
 	ret = miss == bio ? MAP_DONE : -EINTR;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-	cache_bio = bio_alloc_bioset(GFP_NOWAIT,
-			DIV_ROUND_UP(s->insert_bio_sectors, PAGE_SECTORS),
-			&dc->disk.bio_split);
-#else
 	cache_bio = bio_alloc_bioset(miss->bi_bdev,
 			DIV_ROUND_UP(s->insert_bio_sectors, PAGE_SECTORS),
 			0, GFP_NOWAIT, &dc->disk.bio_split);
-#endif
 	if (!cache_bio)
 		goto out_submit;
 
 	cache_bio->bi_iter.bi_sector	= miss->bi_iter.bi_sector;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-	bio_copy_dev(cache_bio, miss);
-#endif
 	cache_bio->bi_iter.bi_size	= s->insert_bio_sectors << 9;
 
 	cache_bio->bi_end_io	= backing_request_endio;
@@ -1012,13 +955,13 @@ static void cached_dev_read(struct cached_dev *dc, struct search *s)
 
 /* Process writes */
 
-static void cached_dev_write_complete(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_write_complete)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
 	up_read_non_owner(&dc->writeback_lock);
-	cached_dev_bio_complete(cl);
+	cached_dev_bio_complete(&cl->work);
 }
 
 static void cached_dev_write(struct cached_dev *dc, struct search *s)
@@ -1062,11 +1005,7 @@ static void cached_dev_write(struct cached_dev *dc, struct search *s)
 		bio_get(s->iop.bio);
 
 		if (bio_op(bio) == REQ_OP_DISCARD &&
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0)
-		    !blk_queue_discard(bdev_get_queue(dc->bdev)))
-#else
 		    !bdev_max_discard_sectors(dc->bdev))
-#endif
 			goto insert_data;
 
 		/* I/O request sent to backing device */
@@ -1084,36 +1023,21 @@ static void cached_dev_write(struct cached_dev *dc, struct search *s)
 			 */
 			struct bio *flush;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-			flush = bio_alloc_bioset(GFP_NOIO, 0,
-						 &dc->disk.bio_split);
-#else
 			flush = bio_alloc_bioset(bio->bi_bdev, 0,
 						 REQ_OP_WRITE | REQ_PREFLUSH,
 						 GFP_NOIO, &dc->disk.bio_split);
-#endif
 			if (!flush) {
 				s->iop.status = BLK_STS_RESOURCE;
 				goto insert_data;
 			}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-			bio_copy_dev(flush, bio);
-#endif
 			flush->bi_end_io = backing_request_endio;
 			flush->bi_private = cl;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-			flush->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
-#endif
 			/* I/O request sent to backing device */
 			closure_bio_submit(s->iop.c, flush, cl);
 		}
 	} else {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		s->iop.bio = bio_clone_fast(bio, GFP_NOIO, &dc->disk.bio_split);
-#else
 		s->iop.bio = bio_alloc_clone(bio->bi_bdev, bio, GFP_NOIO,
 					     &dc->disk.bio_split);
-#endif
 		/* I/O request sent to backing device */
 		bio->bi_end_io = backing_request_endio;
 		closure_bio_submit(s->iop.c, bio, cl);
@@ -1124,9 +1048,9 @@ insert_data:
 	continue_at(cl, cached_dev_write_complete, NULL);
 }
 
-static void cached_dev_nodata(struct closure *cl)
+static CLOSURE_CALLBACK(cached_dev_nodata)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 	struct bio *bio = &s->bio.bio;
 
 	if (s->iop.flush_journal)
@@ -1156,18 +1080,7 @@ static void detached_dev_end_io(struct bio *bio)
 	bio->bi_private = ddip->bi_private;
 
 	/* Count on the bcache device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-	generic_end_io_acct(ddip->d->disk->queue, bio_op(bio),
-			&ddip->d->disk->part0, ddip->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-	bio_end_io_acct(bio, ddip->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-	disk_end_io_acct(ddip->d->disk, bio_op(bio), ddip->start_time);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	part_end_io_acct(ddip->orig_bdev, bio, ddip->start_time);
-#else
 	bio_end_io_acct_remapped(bio, ddip->start_time, ddip->orig_bdev);
-#endif
 
 	if (bio->bi_status) {
 		struct cached_dev *dc = container_of(ddip->d,
@@ -1180,12 +1093,8 @@ static void detached_dev_end_io(struct bio *bio)
 	bio->bi_end_io(bio);
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-static void detached_dev_do_request(struct bcache_device *d, struct bio *bio)
-#else
 static void detached_dev_do_request(struct bcache_device *d, struct bio *bio,
 		struct block_device *orig_bdev, unsigned long start_time)
-#endif
 {
 	struct detached_dev_io_private *ddip;
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
@@ -1204,36 +1113,18 @@ static void detached_dev_do_request(struct bcache_device *d, struct bio *bio,
 
 	ddip->d = d;
 	/* Count on the bcache device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-	ddip->start_time = jiffies;
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-	ddip->start_time = bio_start_io_acct(bio);
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
-	ddip->start_time = disk_start_io_acct(d->disk, bio_sectors(bio), bio_op(bio));
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	ddip->start_time = part_start_io_acct(d->disk, &ddip->orig_bdev, bio);
-#else
 	ddip->orig_bdev = orig_bdev;
 	ddip->start_time = start_time;
-#endif
 	ddip->bi_end_io = bio->bi_end_io;
 	ddip->bi_private = bio->bi_private;
 	bio->bi_end_io = detached_dev_end_io;
 	bio->bi_private = ddip;
 
 	if ((bio_op(bio) == REQ_OP_DISCARD) &&
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0)
-	    !blk_queue_discard(bdev_get_queue(dc->bdev)))
-#else
 	    !bdev_max_discard_sectors(dc->bdev))
-#endif
 		bio->bi_end_io(bio);
 	else
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-		generic_make_request(bio);
-#else
 		submit_bio_noacct(bio);
-#endif
 }
 
 static void quit_max_writeback_rate(struct cache_set *c,
@@ -1276,33 +1167,20 @@ static void quit_max_writeback_rate(struct cache_set *c,
 
 /* Cached devices - read & write stuff */
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	blk_qc_t
-#else
-	void
-#endif
-cached_dev_submit_bio(struct bio *bio)
+void cached_dev_submit_bio(struct bio *bio)
 {
 	struct search *s;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	struct bcache_device *d = bio->bi_disk->private_data;
-#else
 	struct block_device *orig_bdev = bio->bi_bdev;
 	struct bcache_device *d = orig_bdev->bd_disk->private_data;
-	unsigned long start_time;
-#endif
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
+	unsigned long start_time;
 	int rw = bio_data_dir(bio);
 
 	if (unlikely((d->c && test_bit(CACHE_SET_IO_DISABLE, &d->c->flags)) ||
 		     dc->io_disable)) {
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-		return BLK_QC_T_NONE;
-#else
 		return;
-#endif
 	}
 
 	if (likely(d->c)) {
@@ -1319,19 +1197,14 @@ cached_dev_submit_bio(struct bio *bio)
 			quit_max_writeback_rate(d->c, dc);
 		}
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+
 	start_time = bio_start_io_acct(bio);
-#endif
 
 	bio_set_dev(bio, dc->bdev);
 	bio->bi_iter.bi_sector += dc->sb.data_offset;
 
 	if (cached_dev_get(dc)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-		s = search_alloc(bio, d);
-#else
 		s = search_alloc(bio, d, orig_bdev, start_time);
-#endif
 		trace_bcache_request_start(s->d, bio);
 
 		if (!bio->bi_iter.bi_size) {
@@ -1352,20 +1225,10 @@ cached_dev_submit_bio(struct bio *bio)
 		}
 	} else
 		/* I/O request sent to backing device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-		detached_dev_do_request(d, bio);
-#else
 		detached_dev_do_request(d, bio, orig_bdev, start_time);
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	return BLK_QC_T_NONE;
-#else
-	return;
-#endif
 }
 
-static int cached_dev_ioctl(struct bcache_device *d, fmode_t mode,
+static int cached_dev_ioctl(struct bcache_device *d, blk_mode_t mode,
 			    unsigned int cmd, unsigned long arg)
 {
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
@@ -1402,9 +1265,9 @@ static int flash_dev_cache_miss(struct btree *b, struct search *s,
 	return MAP_CONTINUE;
 }
 
-static void flash_dev_nodata(struct closure *cl)
+static CLOSURE_CALLBACK(flash_dev_nodata)
 {
-	struct search *s = container_of(cl, struct search, cl);
+	closure_type(s, struct search, cl);
 
 	if (s->iop.flush_journal)
 		bch_journal_meta(s->iop.c, cl);
@@ -1412,36 +1275,19 @@ static void flash_dev_nodata(struct closure *cl)
 	continue_at(cl, search_free, NULL);
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	blk_qc_t
-#else
-	void
-#endif
-flash_dev_submit_bio(struct bio *bio)
+void flash_dev_submit_bio(struct bio *bio)
 {
 	struct search *s;
 	struct closure *cl;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	struct bcache_device *d = bio->bi_disk->private_data;
-#else
 	struct bcache_device *d = bio->bi_bdev->bd_disk->private_data;
-#endif
 
 	if (unlikely(d->c && test_bit(CACHE_SET_IO_DISABLE, &d->c->flags))) {
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-		return BLK_QC_T_NONE;
-#else
 		return;
-#endif
 	}
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	s = search_alloc(bio, d);
-#else
 	s = search_alloc(bio, d, bio->bi_bdev, bio_start_io_acct(bio));
-#endif
 	cl = &s->cl;
 	bio = &s->bio.bio;
 
@@ -1454,11 +1300,7 @@ flash_dev_submit_bio(struct bio *bio)
 		continue_at_nobarrier(&s->cl,
 				      flash_dev_nodata,
 				      bcache_wq);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-		return BLK_QC_T_NONE;
-#else
 		return;
-#endif
 	} else if (bio_data_dir(bio)) {
 		bch_keybuf_check_overlapping(&s->iop.c->moving_gc_keys,
 					&KEY(d->id, bio->bi_iter.bi_sector, 0),
@@ -1474,12 +1316,9 @@ flash_dev_submit_bio(struct bio *bio)
 	}
 
 	continue_at(cl, search_free, NULL);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	return BLK_QC_T_NONE;
-#endif
 }
 
-static int flash_dev_ioctl(struct bcache_device *d, fmode_t mode,
+static int flash_dev_ioctl(struct bcache_device *d, blk_mode_t mode,
 			   unsigned int cmd, unsigned long arg)
 {
 	return -ENOTTY;

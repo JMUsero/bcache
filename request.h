@@ -34,26 +34,14 @@ struct data_insert_op {
 };
 
 unsigned int bch_get_congested(const struct cache_set *c);
-void bch_data_insert(struct closure *cl);
+CLOSURE_CALLBACK(bch_data_insert);
 
 void bch_cached_dev_request_init(struct cached_dev *dc);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	blk_qc_t cached_dev_submit_bio(struct bio *bio);
-#else
-	void cached_dev_submit_bio(struct bio *bio);
-#endif
+void cached_dev_submit_bio(struct bio *bio);
 
 void bch_flash_dev_request_init(struct bcache_device *d);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-	blk_qc_t flash_dev_submit_bio(struct bio *bio);
-#else
-	void flash_dev_submit_bio(struct bio *bio);
-#endif
+void flash_dev_submit_bio(struct bio *bio);
 
 extern struct kmem_cache *bch_search_cache;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-	#define BIO_MAX_VECS		256U
-#endif
 
 #endif /* _BCACHE_REQUEST_H_ */
